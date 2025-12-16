@@ -91,10 +91,10 @@ def tutor_spotlight(model, test_loader, device):
 # ... existing code ...
 from chessgnn.graph_builder import ChessGraphBuilder
 
-def deep_inspection(model, fen, device, builder):
+def deep_inspection(model, fen, sequence, device, builder):
     """
     Evaluates ALL legal moves in the position and logs a ranked list.
-    This provides the 'Why' behind the model's thinking.
+    Now temporally aware: uses the provided history sequence.
     """
     model.eval()
     board = chess.Board(fen)
@@ -105,11 +105,14 @@ def deep_inspection(model, fen, device, builder):
 
     logger.info(f"\n🔍 DEEP INSPECTION (Step Analysis) 🔍")
     logger.info(f"Position: {fen}")
-    logger.info(f"Evaluating {len(legal_moves)} legal moves to find the best continuation...")
+    logger.info(f"Evaluating {len(legal_moves)} legal moves with history context...")
     
     move_analysis = []
     
-    # Batch evaluation would be faster, but loop is safer for memory/implementation simplicity right now
+    # Pre-process history: ensure it's on device
+    history_window = [g.to(device) for g in sequence]
+    # If history is full (window size 8), we'll slice [1:] when appending new move
+    
     for move in legal_moves:
         board.push(move)
         # Convert resultant position to graph
@@ -117,16 +120,29 @@ def deep_inspection(model, fen, device, builder):
             graph = builder.fen_to_graph(board.fen())
             graph = graph.to(device)
             
+            # Construct Temporal Sequence for this candidate
+            # Pivot: Slide window if needed found in dataset.py logic?
+            # Model GRU handles variable length, but for consistency with training (window=8),
+            # we should maintain similar context length.
+            # If len(history_window) >= 8, drop first.
+            
+            if len(history_window) >= 8:
+                 candidate_seq = history_window[1:] + [graph]
+            else:
+                 candidate_seq = history_window + [graph]
+            
             # Model evaluation
-            score = model([graph]).item()
+            # Pass as list of graphs (model expects sequence_graphs)
+            score = model(candidate_seq).item()
                 
-            # Apply Tanh for display (map unbounded score to -1..1)
-            display_score = math.tanh(score)
+            # Softsign is already in model, outputs -1..1
+            display_score = score 
+            # Convert to Win Prob %
             win_prob = (display_score + 1) / 2 * 100
             
             move_analysis.append((move.uci(), win_prob, score))
         except Exception as e:
-            pass # Skip invalid graph generations if any
+            pass 
         finally:
             board.pop()
             
@@ -189,11 +205,10 @@ def train():
     
     # Loss Functions
     mse_criterion = nn.MSELoss() 
-    # Ranking Margin (how much better the played move should be than the random move)
-    ranking_margin = 0.1 
+    # Ranking Margin removed (Outcome Regression Only)
     
-    train_loader = DataLoader(train_dataset, batch_size=1, collate_fn=custom_collate)
-    test_loader = DataLoader(test_dataset, batch_size=1, collate_fn=custom_collate)
+    train_loader = DataLoader(train_dataset, batch_size=1, collate_fn=custom_collate, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=1, collate_fn=custom_collate, num_workers=4)
     
     logger.info("Starting training loop...")
     
@@ -216,9 +231,11 @@ def train():
             # Game Boundary Check
             sample_game_id = sample_dict['game_id']
             if current_game_id is None: current_game_id = sample_game_id
+            # Logspam reduction: With parallel workers, IDs flip constantly. 
+            # We disable "Game Finished" logging to clean up the output.
             if sample_game_id != current_game_id:
-                avg_game_loss = game_loss_accum / game_steps if game_steps > 0 else 0
-                logger.info(f"==> Game {current_game_id} Finished | Avg Loss: {avg_game_loss:.4f}")
+                # avg_game_loss = game_loss_accum / game_steps if game_steps > 0 else 0
+                # logger.info(f"==> Game {current_game_id} Finished | Avg Loss: {avg_game_loss:.4f}")
                 current_game_id = sample_game_id
                 game_loss_accum = 0.0
                 game_steps = 0
@@ -239,82 +256,14 @@ def train():
             
             mse_loss = mse_criterion(score_pos, target)
             
-            # 2. Ranking Loss (Constraint: Played Move > Random Move)
-            # We are at State_t. The played move (Move_P) leads to State_{t+1}.
-            # The Random Move (Move_R) leads to State_{t+1}'
-            
-            # User wants: V(Move_P) > V(Move_R)
-            # But we are forwarding State_t. Does the model see the move?
-            # NO. The model sees the BOARD. 
-            # So V(State_t) is the evaluation of the position BEFORE the move.
-            
-            # Wait. If we want to recommend a move, we perform input: Graph(State_After_Move).
-            # So to train this, we must feed:
-            # Pos: Graph(State_After_Move_P)  (Which is actually State_{t+1})
-            # Neg: Graph(State_After_Move_R)
-            
-            # Challenge: Our Dataset yields State_t.
-            # State_{t+1} is in the NEXT sample?
-            # Yes, `sequence` is shifting window/buffer.
-            # But for *Ranking*, we need to generate these graphs ON THE FLY from State_t.
-            
-            ranking_loss = torch.tensor(0.0, device=device)
-            
-            played_move_uci = sample_dict.get('played_move_uci')
-            fen = sample_dict['fen']
-            
-            if played_move_uci:
-                board = chess.Board(fen)
-                legal_moves = list(board.legal_moves)
-                
-                # Check if we have enough moves to rank
-                if len(legal_moves) > 1:
-                    played_move = chess.Move.from_uci(played_move_uci)
-                    
-                    # 2a. Generate Graph for Positive (Result of Played Move)
-                    board.push(played_move)
-                    try:
-                        g_pos = graph_builder.fen_to_graph(board.fen()).to(device)
-                        score_after_pos = model([g_pos])
-                    except:
-                        score_after_pos = None
-                    board.pop()
-                    
-                    # 2b. Generate Graph for Negative (Result of Random Move)
-                    # Pick random move != played_move
-                    candidates = [m for m in legal_moves if m != played_move]
-                    if candidates and score_after_pos is not None:
-                        neg_move = random.choice(candidates)
-                        board.push(neg_move)
-                        try:
-                            g_neg = graph_builder.fen_to_graph(board.fen()).to(device)
-                            score_after_neg = model([g_neg])
-                            
-                            # 2c. Compute Ranking Loss
-                            # If White to move: Want Score_Pos > Score_Neg
-                            # If Black to move: Want Score_Pos < Score_Neg (Score is "White Advantage")
-                            
-                            margin = ranking_margin
-                            
-                            if board.turn == chess.BLACK: # Note: We popped, turn is back to original player
-                                # White just moved. White wants Score to be higher.
-                                # Loss = max(0, Score_Neg - Score_Pos + Margin)
-                                r_loss = torch.relu(score_after_neg - score_after_pos + margin)
-                            else:
-                                # Black just moved. Black wants Score to be lower.
-                                # Target is e.g. -1. 
-                                # We want Score_Pos < Score_Neg
-                                # Loss = max(0, Score_Pos - Score_Neg + margin)
-                                r_loss = torch.relu(score_after_pos - score_after_neg + margin)
-                                
-                            ranking_loss = r_loss
-                            
-                        except:
-                            pass
-                        board.pop()
+            # --- MODIFIED: Removed "Easy Negative" Ranking Loss ---
+            # We now rely solely on Outcome Regression (MSE) to learn the Value Function V(s).
+            # This avoids the trap of learning "Safe > Blunder" without learning true strategy.
+            # To recommend moves, we simply evaluate V(s') for all legal next states s'.
 
             # Loss
-            loss = mse_loss + ranking_loss
+            loss = mse_loss
+
             
             loss.backward()
             
@@ -339,16 +288,16 @@ def train():
                  # Actually, let's just stick to the -1..1 semantics for 'WinProb'
                  raw_score = score_pos.item()
                  # Apply soft clipping for display
-                 display_score = math.tanh(raw_score)
+                 # Softsign maps to -1..1
+                 display_score = raw_score 
                  win_prob = (display_score + 1) / 2 * 100
                  
-                 r_loss_val = ranking_loss.item() if isinstance(ranking_loss, torch.Tensor) else 0
-                 logger.info(f"Step {epoch_steps} | Game {current_game_id} | Loss: {current_loss:.4f} (MSE:{mse_loss.item():.4f} Rnk:{r_loss_val:.4f}) | WinProb: {win_prob:.1f}%")
+                 logger.info(f"Step {epoch_steps} | Game {current_game_id} | Loss: {current_loss:.4f} (MSE:{mse_loss.item():.4f}) | WinProb: {win_prob:.1f}%")
 
             # --- NEW: DEEP INSPECTION EVERY 100 STEPS ---
             if epoch_steps % 100 == 0:
                  try:
-                    deep_inspection(model, sample_dict['fen'], device, graph_builder)
+                    deep_inspection(model, sample_dict['fen'], sample_dict['sequence'], device, graph_builder)
                  except Exception as e:
                     logger.error(f"Deep inspection failed: {e}")
 

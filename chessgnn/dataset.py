@@ -24,13 +24,12 @@ class ChessGraphIterableDataset(IterableDataset):
         self.builder = ChessGraphBuilder()
         
     def __iter__(self):
+        worker_id = 0
+        num_workers = 1
         worker_info = torch.utils.data.get_worker_info()
-        if worker_info is not None and worker_info.num_workers > 1:
-            # Multi-worker split: This is naive (all workers read same file) unless we shard.
-            # For PGN, random access is hard. We suggest num_workers=0 or 1.
-            # Or simplified: only worker 0 yields data.
-            if worker_info.id != 0:
-                return
+        if worker_info is not None:
+             worker_id = worker_info.id
+             num_workers = worker_info.num_workers
         
         with open(self.pgn_file) as f:
             # Skip offset
@@ -40,13 +39,22 @@ class ChessGraphIterableDataset(IterableDataset):
 
             games_processed = 0
             while games_processed < self.num_games:
+                # We interpret "games_processed" as the index relative to offset
+                current_idx = games_processed
+                
+                # Check ownership BEFORE reading? 
+                # No, we must read sequentially to advance file pointer.
+                # PGN is not random access. We must parse every game header/content 
+                # to advance the stream, even if we discard it.
+                # This is IO bound but avoids Parsing Moves/Building Graphs (CPU bound).
+                
                 game = chess.pgn.read_game(f)
                 if game is None:
                     break
                     
-                # Process this game's moves
-                # We yield samples game by game
-                yield from self._process_game_stream(game, game_id=games_processed + self.offset)
+                # Sharding: Process only if (index % num_workers) == worker_id
+                if current_idx % num_workers == worker_id:
+                    yield from self._process_game_stream(game, game_id=current_idx + self.offset)
                 
                 games_processed += 1
 
@@ -72,6 +80,10 @@ class ChessGraphIterableDataset(IterableDataset):
         
         # Move Sequence
         game_moves = list(game.mainline_moves())
+        
+        # Filter: Skip short games (< 5 moves = 10 plies)
+        if len(game_moves) < 5:
+            return
         
         for i, move in enumerate(game_moves):
             # 1. Construct Sample from current state (before push)

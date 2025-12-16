@@ -248,8 +248,8 @@ class STHGATLikeModel(nn.Module):
         self.value_head = nn.Sequential(
             Linear(hidden_channels, hidden_channels),
             nn.ReLU(),
-            Linear(hidden_channels, 1),
-            nn.Identity() # Outputs unbounded scalar (regression)
+            nn.Linear(hidden_channels, 1),
+            nn.Softsign() # Outputs bounded scalar (-1 to 1)
         )
         
         # Initialize final layer to 0 to start with 0.0 prediction
@@ -257,46 +257,44 @@ class STHGATLikeModel(nn.Module):
         nn.init.constant_(self.value_head[2].bias, 0.0)
 
     def forward(self, sequence_graphs):
-        # sequence_graphs: List[HeteroData]
-        # MVP: Just use the last frame G_t. 
+        # sequence_graphs: List[HeteroData] (Length T)
         
-        data = sequence_graphs[-1] # Only use the latest position
+        temporal_embeddings = []
         
-        # Projection
-        x_dict = data.x_dict.copy()
-        x_dict['square'] = self.square_proj(x_dict['square'])
-        
-        # Edge Weights
-        ew_dict = {}
-        if ('piece', 'interacts', 'piece') in data.edge_attr_dict:
+        for data in sequence_graphs:
+            # 1. Spatial Encode per Graph
+            x_dict = data.x_dict.copy()
+            x_dict['square'] = self.square_proj(x_dict['square'])
+            
+            # Edge Weights
+            ew_dict = {}
+            if ('piece', 'interacts', 'piece') in data.edge_attr_dict:
                  ew_dict[('piece', 'interacts', 'piece')] = data['piece', 'interacts', 'piece'].edge_attr[:, 0]
 
-        # Multi-Layer GNN Pass
-        for i, conv in enumerate(self.convs):
-             # For subsequent layers, input is hidden_channels, so we don't need to project square again?
-             # Wait, x_dict keys are node types. 'square' is projected to 10.
-             # First layer takes 10. Output is hidden (e.g. 64).
-             # So x_dict updates.
-             
-             # If it's not the first layer, the 'square' input dim is hidden_channels (64).
-             # But WeightedHGTConv init says: if in != out, use skip.
-             # My subsequent layers are 64->64.
-             # My first layer is 10->64.
-             
-             # Problem: 'square' starts at 10. 'piece' starts at 10.
-             # First layer works perfectly. Output x_dict has 64.
-             # Second layer takes x_dict (64) -> Output (64).
-             # Works perfectly.
-             
-             x_dict = conv(x_dict, data.edge_index_dict, ew_dict)
-        
-        z_dict = x_dict # Final embeddings
+            # Multi-Layer GNN Pass
+            for i, conv in enumerate(self.convs):
+                 x_dict = conv(x_dict, data.edge_index_dict, ew_dict)
+            
+            z_dict = x_dict 
 
-        # Pool node embeddings into a single Graph Embedding
-        # Simple Mean Pooling for MVP:
-        piece_embeds = z_dict['piece'] 
-        graph_embed = torch.mean(piece_embeds, dim=0) # [Hidden_Dim]
+            # Pool node embeddings into a single Graph Embedding
+            piece_embeds = z_dict['piece'] 
+            graph_embed = torch.mean(piece_embeds, dim=0) # [Hidden_Dim]
+            
+            temporal_embeddings.append(graph_embed)
+            
+        # Stack Temporal Sequence
+        # Shape: [1, Sequence_Length, Hidden_Dim] (Batch=1)
+        seq_tensor = torch.stack(temporal_embeddings).unsqueeze(0) 
         
-        # Predict Win Probability
-        value = self.value_head(graph_embed)
+        # 2. Temporal Process (GRU)
+        # Output: [1, Sequence_Length, Hidden_Dim]
+        # h_n: [1, 1, Hidden_Dim]
+        gru_out, h_n = self.global_gru(seq_tensor)
+        
+        # Use the final state
+        final_embedding = h_n.squeeze(0).squeeze(0) # [Hidden_Dim]
+        
+        # 3. Predict Win Probability
+        value = self.value_head(final_embedding)
         return value
