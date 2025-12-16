@@ -224,39 +224,6 @@ class STHGATLikeModel(nn.Module):
             
         return z_final
 
-class PointerNetwork(nn.Module):
-    def __init__(self, hidden_dim):
-        super().__init__()
-        # Score is f(u, v, e)
-        # e is edge type/weight if applicable, or just simple concatenation
-        self.score_net = nn.Sequential(
-            Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            Linear(hidden_dim, 1)
-        )
-
-    def forward(self, z_dict, legal_moves_indices):
-        """
-        legal_moves_indices: List of tuples (src_node_idx, dst_node_idx, is_dst_piece)
-        We assume 'src' is always a piece.
-        'dst' can be a square (quiet move) or a piece (capture).
-        """
-        scores = []
-        for src_idx, dst_idx, is_dst_piece in legal_moves_indices:
-            h_src = z_dict['piece'][src_idx]
-            
-            if is_dst_piece:
-                h_dst = z_dict['piece'][dst_idx]
-            else:
-                h_dst = z_dict['square'][dst_idx]
-            
-            # Concat
-            pair_embed = torch.cat([h_src, h_dst], dim=0)
-            score = self.score_net(pair_embed)
-            scores.append(score)
-            
-        return torch.cat(scores) if scores else torch.tensor([])
-
 class STHGATLikeModel(nn.Module):
     def __init__(self, metadata, hidden_channels=64, num_layers=2):
         super().__init__()
@@ -266,22 +233,21 @@ class STHGATLikeModel(nn.Module):
         # Temporal RNN (Simplified: GRU over global graph state)
         self.global_gru = nn.GRU(hidden_channels, hidden_channels, batch_first=True)
         
-        self.pointer_head = PointerNetwork(hidden_channels)
         self.hidden_channels = hidden_channels
+        
+        # Add Value Head
+        self.value_head = nn.Sequential(
+            Linear(hidden_channels, hidden_channels),
+            nn.ReLU(),
+            Linear(hidden_channels, 1),
+            nn.Tanh() # Outputs between -1 (Loss) and 1 (Win)
+        )
 
-    def forward(self, sequence_graphs, legal_moves_indices_list):
-        # sequence_graphs: List[HeteroData] corresponding to ONE game window [t-L...t]
-        # legal_moves_indices_list: List of legal moves mappings for the LAST graph in sequence
+    def forward(self, sequence_graphs):
+        # sequence_graphs: List[HeteroData]
         
         # 1. Encode Sequence
-        # We run the GNN on each frame INDEPENDENTLY (sharing weights) to get node embeddings.
-        # Then we pool them to get graph embeddings for the RNN?
-        # OR we just run GNN on the last frame `t` because `t` contains the state we act on.
-        # The prompt says: "Input Tensor ... G_{t-L} ... EvolveGCN".
-        # EvolveGCN updates GNN weights.
-        # MVP: Just use the last frame G_t. The history is captured in node features (h_hist) if we implemented that.
-        # But we didn't implement h_hist in builder yet.
-        # Let's trust the GNN on G_t for now to respect complexity limits.
+        # MVP: Just use the last frame G_t. 
         
         data = sequence_graphs[-1] # Only use the latest position
         
@@ -297,10 +263,11 @@ class STHGATLikeModel(nn.Module):
         # GNN Pass
         z_dict = self.encoder(x_dict, data.edge_index_dict, ew_dict)
         
-        # 2. Pointer Head
-        # We need to map the legal moves (from chess.Move) to node indices in `z_dict`.
-        # legal_moves_indices_list must be computed outside (in dataset or training loop)
-        # because it requires graph internal indices.
+        # Pool node embeddings into a single Graph Embedding
+        # Simple Mean Pooling for MVP:
+        piece_embeds = z_dict['piece'] 
+        graph_embed = torch.mean(piece_embeds, dim=0) # [Hidden_Dim]
         
-        scores = self.pointer_head(z_dict, legal_moves_indices_list)
-        return scores
+        # Predict Win Probability
+        value = self.value_head(graph_embed)
+        return value

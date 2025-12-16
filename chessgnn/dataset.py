@@ -51,10 +51,18 @@ class ChessGraphIterableDataset(IterableDataset):
                 games_processed += 1
 
     def _process_game_stream(self, game: chess.pgn.Game, game_id: int):
+        # 1. Extract Result (1-0, 0-1, 1/2-1/2)
+        result = game.headers.get("Result", "*")
+        if result == "1-0":
+            game_value = 1.0
+        elif result == "0-1":
+            game_value = -1.0
+        else:
+            game_value = 0.0 # Draw or unknown
+
         board = game.board()
         
         # Buffer for sliding window: List of (fen, graph)
-        # We only need to store the last 'window_size' graphs to avoid re-computing.
         window_buffer = []  
         
         # Initial State
@@ -64,35 +72,26 @@ class ChessGraphIterableDataset(IterableDataset):
         
         # Move Sequence
         game_moves = list(game.mainline_moves())
-        # We iterate through moves to generate (Input, Target) pairs
-        
-        # Input at step t: window of graphs ending at state t
-        # Target at step t: move chosen at state t (which leads to t+1)
-        
-        # current board is at initial state (step 0)
-        # We have 1 graph in buffer.
         
         for i, move in enumerate(game_moves):
-            # i is step index. move is the action taken at step i.
-            
             # 1. Construct Sample from current state (before push)
-            # We need a sequence of length up to window_size ending at current state.
             
             # Slice buffer
             start_index = max(0, len(window_buffer) - self.window_size)
             sequence_graphs = window_buffer[start_index:]
             
-            # Target Index
             current_legal_moves = list(board.legal_moves)
-            try:
-                target_idx = current_legal_moves.index(move)
-            except ValueError:
-                target_idx = 0 # Fallback
-                
+
+            # KEY CHANGE: The target is now the Game Value
+            # If turn is WHITE: target is game_value
+            # If turn is BLACK: target is -game_value (or handle relative to 'player to move')
+            
+            current_turn_value = game_value if board.turn == chess.WHITE else -game_value
+            
             yield {
-                'sequence': sequence_graphs, # List of HeteroData
-                'legal_moves': current_legal_moves,
-                'target_index': target_idx,
+                'sequence': sequence_graphs, 
+                'legal_moves': current_legal_moves, # Keep for visualization/inference
+                'target_value': current_turn_value, # <--- NEW TARGET
                 'fen': board.fen(),
                 'game_id': game_id
             }
@@ -103,7 +102,7 @@ class ChessGraphIterableDataset(IterableDataset):
             new_graph = self.builder.fen_to_graph(new_fen)
             window_buffer.append(new_graph)
             
-            # Optimize buffer size?
+            # Optimize buffer size
             if len(window_buffer) > self.window_size:
                 window_buffer.pop(0)
 

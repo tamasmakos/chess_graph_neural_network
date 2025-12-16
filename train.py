@@ -11,11 +11,11 @@ from chessgnn.model import STHGATLikeModel
 
 # Configuration
 PGN_FILE = "/workspaces/chessgnn/input/lichess_db_standard_rated_2013-01.pgn"
-BATCH_SIZE = 1 # We use batch size 1 (sequence of 1 game) for simplicity
-HIDDEN_DIM = 64
-LR = 0.001
-EPOCHS = 10
-TRAIN_GAMES = 300
+BATCH_SIZE = 10 # We use batch size 1 (sequence of 1 game) for simplicity
+HIDDEN_DIM = 128
+LR = 0.002
+EPOCHS = 2
+TRAIN_GAMES = 100
 TEST_GAMES = 50
 
 # Setup Logging
@@ -32,49 +32,60 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def _map_moves_to_indices(legal_moves, last_graph, fen):
+def tutor_spotlight(model, test_loader, device):
     """
-    Maps chess.Move objects to (src_node_idx, dst_node_idx, is_dst_piece) tuple.
+    Selects a random position from the test set and has the model 'commentate' on it.
     """
+    model.eval()
+    logger.info("\n" + "="*50)
+    logger.info("  ♟️  TUTOR SPOTLIGHT ANALYST  ♟️")
+    logger.info("="*50)
+    
+    # Grab one batch (game)
+    batch = next(iter(test_loader))
+    sample_dict = batch[0]
+    
+    # Pick a random step in the game sequence
+    seq_len = len(sample_dict['sequence'])
+    if seq_len == 0: return # Safety
+    
+    # Use the last frame (latest position)
+    graph = sample_dict['sequence'][-1].to(device)
+    fen = sample_dict['fen']
+    target_val = sample_dict['target_value']
+    
+    # Run Model
+    with torch.no_grad():
+        # Model expects a list of graphs (sequence)
+        score = model([graph]).item() # -1 to 1
+    
+    # Visual Interpretation
+    win_prob = (score + 1) / 2 * 100 # 0% to 100%
+    
+    # Color/Emoji logic
+    if win_prob > 55:
+        judgement = "White is winning"
+        emoji = "⚪"
+    elif win_prob < 45:
+        judgement = "Black is winning"
+        emoji = "⚫"
+    else:
+        judgement = "Position is Equal"
+        emoji = "⚖️"
+        
+    actual_res = "Draw"
+    if target_val > 0.5: actual_res = "White Won"
+    elif target_val < -0.5: actual_res = "Black Won"
+    
     board = chess.Board(fen)
+    logger.info(f"Position: {fen}")
+    logger.info(f"Analysis: {emoji} {judgement} ({win_prob:.1f}% Win Prob)")
+    logger.info(f"Actual Game Result: {actual_res}")
     
-    # Reconstruct Piece Map (Square -> Piece Node Index)
-    # Logic matches Reader/GraphBuilder: pieces added in 0..63 order of squares.
-    piece_map = {} 
-    curr_idx = 0
-    for sq in chess.SQUARES:
-        p = board.piece_at(sq)
-        if p:
-            piece_map[sq] = curr_idx
-            curr_idx += 1
-            
-    # Square Node Index is just the square integer (0..63)
-    square_map = {sq: i for i, sq in enumerate(chess.SQUARES)} 
-    
-    legal_indices = []
-    for move in legal_moves:
-        from_sq = move.from_square
-        to_sq = move.to_square
-        
-        if from_sq not in piece_map:
-            continue
-            
-        src_idx = piece_map[from_sq]
-        dst_piece = board.piece_at(to_sq)
-        
-        if dst_piece:
-            # Capturing a piece
-            if to_sq in piece_map:
-                dst_idx = piece_map[to_sq]
-                legal_indices.append((src_idx, dst_idx, True))
-            else:
-                pass
-        else:
-            # Moving to a square
-            dst_idx = square_map[to_sq]
-            legal_indices.append((src_idx, dst_idx, False))
-            
-    return legal_indices
+    # Simple ASCII Board
+    logger.info("\n" + str(board) + "\n")
+    logger.info("="*50 + "\n")
+
 
 def train():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -99,7 +110,7 @@ def train():
     logger.info(f"Model Initialized: STHGATLikeModel with hidden_dim={HIDDEN_DIM}")
     
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.MSELoss() 
     
     train_loader = DataLoader(train_dataset, batch_size=1, collate_fn=custom_collate)
     test_loader = DataLoader(test_dataset, batch_size=1, collate_fn=custom_collate)
@@ -118,21 +129,13 @@ def train():
         
         # Per-Game Stats placeholders
         current_game_id = None
-        game_correct = 0
-        game_total = 0
         game_loss_accum = 0.0
+        game_steps = 0
         
         for batch in pbar:
             sample_dict = batch[0]
             
             # Game Boundary Check
-            # DataLoader collates into batch, so we access item 0
-            # sample_dict['game_id'] might be a Tensor if collated default, 
-            # but custom_collate returns list of dicts? 
-            # No, custom_collate returns batch (list of dicts). 
-            # sample_dict is the dict itself.
-            # 'game_id' is int because we didn't convert to tensor in dataset.
-            
             sample_game_id = sample_dict['game_id']
             
             if current_game_id is None:
@@ -140,33 +143,27 @@ def train():
                 
             if sample_game_id != current_game_id:
                 # Finish previous game
-                acc = game_correct / game_total if game_total > 0 else 0
-                avg_game_loss = game_loss_accum / game_total if game_total > 0 else 0
-                logger.info(f"==> Game {current_game_id} Finished | Accuracy: {acc*100:.1f}% ({game_correct}/{game_total}) | Avg Loss: {avg_game_loss:.4f}")
+                avg_game_loss = game_loss_accum / game_steps if game_steps > 0 else 0
+                logger.info(f"==> Game {current_game_id} Finished | Avg Loss: {avg_game_loss:.4f}")
                 
                 # Reset for new game
                 current_game_id = sample_game_id
-                game_correct = 0
-                game_total = 0
                 game_loss_accum = 0.0
+                game_steps = 0
             
             sequence = sample_dict['sequence'] 
             # Move to device
             sequence = [g.to(device) for g in sequence]
             
-            legal_moves = sample_dict['legal_moves']
-            target_idx = torch.tensor([sample_dict['target_index']], device=device)
-            
-            # Map Moves
-            last_graph = sequence[-1]
-            legal_indices = _map_moves_to_indices(legal_moves, last_graph, sample_dict['fen'])
+            # Target
+            target = torch.tensor([sample_dict['target_value']], device=device).float()
             
             # Forward
             optimizer.zero_grad()
-            scores = model(sequence, legal_indices) 
+            scores = model(sequence) # Returns scalar [-1, 1]
             
             # Loss
-            loss = criterion(scores.unsqueeze(0), target_idx)
+            loss = criterion(scores, target)
             loss.backward()
             optimizer.step()
             
@@ -177,37 +174,27 @@ def train():
             
             # Update Game Stats
             game_loss_accum += current_loss
-            pred_idx = torch.argmax(scores).item()
-            if pred_idx == target_idx.item():
-                game_correct += 1
-            game_total += 1
+            game_steps += 1
             
-            # Logging detailed step info every 10 steps
-            if epoch_steps % 10 == 0:
-                 pred_idx = torch.argmax(scores).item()
-                 # Get UCI moves for logging
-                 try:
-                     pred_move = legal_moves[pred_idx]
-                     true_move = legal_moves[target_idx.item()]
-                     logger.info(f"Epoch {epoch+1} | Step {epoch_steps} | Game {current_game_id} | Loss: {current_loss:.4f} | Pred: {pred_move} | Target: {true_move}")
-                 except:
-                     pass # Fallback if indices are off
+            # Logging detailed step info every 50 steps
+            if epoch_steps % 50 == 0:
+                 # Convert score to Win Probability %
+                 win_prob = (scores.item() + 1) / 2 * 100
+                 logger.info(f"Epoch {epoch+1} | Step {epoch_steps} | Game {current_game_id} | Loss: {current_loss:.4f} | WinProb: {win_prob:.1f}% | Target: {target.item():.2f}")
             
             pbar.set_postfix({'Loss': total_loss / max(1, total_samples)})
             
         # Report last game of epoch
-        if game_total > 0:
-            acc = game_correct / game_total if game_total > 0 else 0
-            avg_game_loss = game_loss_accum / game_total if game_total > 0 else 0
-            logger.info(f"==> Game {current_game_id} Finished | Accuracy: {acc*100:.1f}% ({game_correct}/{game_total}) | Avg Loss: {avg_game_loss:.4f}")
+        if game_steps > 0:
+            avg_game_loss = game_loss_accum / game_steps if game_steps > 0 else 0
+            logger.info(f"==> Game {current_game_id} Finished | Avg Loss: {avg_game_loss:.4f}")
 
-            
         avg_loss = total_loss / max(1, total_samples)
         logger.info(f"Epoch {epoch+1}/{EPOCHS} Completed | Avg Loss: {avg_loss:.4f}")
         
     # Evaluation
     model.eval()
-    test_correct = 0
+    test_loss = 0
     test_total = 0
     
     logger.info("Evaluating on test set...")
@@ -215,19 +202,19 @@ def train():
         for batch in tqdm(test_loader):
             sample_dict = batch[0]
             sequence = [g.to(device) for g in sample_dict['sequence']]
-            legal_moves = sample_dict['legal_moves']
-            target_idx = sample_dict['target_index']
+            target = torch.tensor([sample_dict['target_value']], device=device).float()
             
-            legal_indices = _map_moves_to_indices(legal_moves, sequence[-1], sample_dict['fen'])
-            scores = model(sequence, legal_indices)
+            scores = model(sequence)
+            loss = criterion(scores, target)
             
-            pred_idx = torch.argmax(scores).item()
-            if pred_idx == target_idx:
-                test_correct += 1
+            test_loss += loss.item()
             test_total += 1
             
-    acc = test_correct/test_total if test_total > 0 else 0
-    logger.info(f"Test Evaluation Completed | Accuracy: {acc:.4f} ({test_correct}/{test_total})")
+    avg_test_loss = test_loss/test_total if test_total > 0 else 0
+    logger.info(f"Test Evaluation Completed | Avg MSE Loss: {avg_test_loss:.4f}")
+
+    # Run Tutor Spotlight
+    tutor_spotlight(model, test_loader, device)
 
     # Save Model
     save_path = os.path.join("output", "st_hgat_model.pt")
