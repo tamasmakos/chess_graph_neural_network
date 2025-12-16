@@ -86,12 +86,17 @@ class ChessGraphIterableDataset(IterableDataset):
             # If turn is WHITE: target is game_value
             # If turn is BLACK: target is -game_value (or handle relative to 'player to move')
             
-            current_turn_value = game_value if board.turn == chess.WHITE else -game_value
-            
+            # The original code had current_turn_value, but the instruction's snippet
+            # implies a change to target_value and target_index.
+            # Assuming the instruction's snippet is the desired state for the yield block.
+            target_idx = 0 # Fallback
+                
             yield {
-                'sequence': sequence_graphs, 
-                'legal_moves': current_legal_moves, # Keep for visualization/inference
-                'target_value': current_turn_value, # <--- NEW TARGET
+                'sequence': list(window_buffer), # List of HeteroData
+                'legal_moves': current_legal_moves,
+                'target_index': target_idx,
+                'target_value': game_value, # 1.0, -1.0, 0.0
+                'played_move_uci': move.uci(), # Explicitly yield the move played
                 'fen': board.fen(),
                 'game_id': game_id
             }

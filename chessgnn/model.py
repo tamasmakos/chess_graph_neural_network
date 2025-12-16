@@ -225,28 +225,39 @@ class STHGATLikeModel(nn.Module):
         return z_final
 
 class STHGATLikeModel(nn.Module):
-    def __init__(self, metadata, hidden_channels=64, num_layers=2):
+    def __init__(self, metadata, hidden_channels=64, num_layers=3):
         super().__init__()
-        self.encoder = WeightedHGTConv(10, hidden_channels, metadata, heads=4) 
+        self.num_layers = num_layers
+        self.hidden_channels = hidden_channels
+        
         self.square_proj = Linear(3, 10) 
         
+        # Stack of GNN Layers
+        self.convs = nn.ModuleList()
+        # First layer: input dim 10 -> hidden
+        self.convs.append(WeightedHGTConv(10, hidden_channels, metadata, heads=4))
+        
+        # Subsequent layers: hidden -> hidden
+        for _ in range(num_layers - 1):
+             self.convs.append(WeightedHGTConv(hidden_channels, hidden_channels, metadata, heads=4))
+
         # Temporal RNN (Simplified: GRU over global graph state)
         self.global_gru = nn.GRU(hidden_channels, hidden_channels, batch_first=True)
-        
-        self.hidden_channels = hidden_channels
         
         # Add Value Head
         self.value_head = nn.Sequential(
             Linear(hidden_channels, hidden_channels),
             nn.ReLU(),
             Linear(hidden_channels, 1),
-            nn.Tanh() # Outputs between -1 (Loss) and 1 (Win)
+            nn.Identity() # Outputs unbounded scalar (regression)
         )
+        
+        # Initialize final layer to 0 to start with 0.0 prediction
+        nn.init.constant_(self.value_head[2].weight, 0.0)
+        nn.init.constant_(self.value_head[2].bias, 0.0)
 
     def forward(self, sequence_graphs):
         # sequence_graphs: List[HeteroData]
-        
-        # 1. Encode Sequence
         # MVP: Just use the last frame G_t. 
         
         data = sequence_graphs[-1] # Only use the latest position
@@ -260,9 +271,27 @@ class STHGATLikeModel(nn.Module):
         if ('piece', 'interacts', 'piece') in data.edge_attr_dict:
                  ew_dict[('piece', 'interacts', 'piece')] = data['piece', 'interacts', 'piece'].edge_attr[:, 0]
 
-        # GNN Pass
-        z_dict = self.encoder(x_dict, data.edge_index_dict, ew_dict)
+        # Multi-Layer GNN Pass
+        for i, conv in enumerate(self.convs):
+             # For subsequent layers, input is hidden_channels, so we don't need to project square again?
+             # Wait, x_dict keys are node types. 'square' is projected to 10.
+             # First layer takes 10. Output is hidden (e.g. 64).
+             # So x_dict updates.
+             
+             # If it's not the first layer, the 'square' input dim is hidden_channels (64).
+             # But WeightedHGTConv init says: if in != out, use skip.
+             # My subsequent layers are 64->64.
+             # My first layer is 10->64.
+             
+             # Problem: 'square' starts at 10. 'piece' starts at 10.
+             # First layer works perfectly. Output x_dict has 64.
+             # Second layer takes x_dict (64) -> Output (64).
+             # Works perfectly.
+             
+             x_dict = conv(x_dict, data.edge_index_dict, ew_dict)
         
+        z_dict = x_dict # Final embeddings
+
         # Pool node embeddings into a single Graph Embedding
         # Simple Mean Pooling for MVP:
         piece_embeds = z_dict['piece'] 
