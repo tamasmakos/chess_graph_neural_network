@@ -1,95 +1,84 @@
 # Spatio-Temporal Heterogeneous Graph Attention Network (ST-HGAT) for Chess
 
 ## 1. Abstract
-This repository implements a **Spatio-Temporal Heterogeneous Graph Attention Network (ST-HGAT)** designed to reason about chess positions as trajectories on a high-dimensional graph manifold, rather than sequences of static image tensors. By constructing a heterogeneous graph of physical pieces and spatial squares, explicitly modeling tactical relationships (pins, forks) via geometric "Ray" edges, and employing a Pointer Network for move selection, this architecture provides a strong inductive bias for tactical pattern recognition in chess.
+This repository implements a **Value-Based Chess Tutor** using a Spatio-Temporal Heterogeneous Graph Attention Network (ST-HGAT). Instead of predicting moves directly (Policy Network), this model learns to **evaluate board states** (Value Network) and ranks legal moves by simulating their outcomes. By constructing a heterogeneous graph of physical pieces, squares, and "Ray" edges (for pins/forks), the model learns an inductive bias for tactical patterns. Training utilizes **Contrastive Ranking Loss** to explicitly differentiate between "played" moves (ground truth) and random legal moves, forcing the model to learn relative move quality.
 
-## 2. How it Works (In Plain English)
-For those not familiar with Graph Neural Networks, here is the intuition behind our approach:
+## 2. The Logic: "Evaluate & Rank"
+Comparing to traditional engines or policy networks:
 
-1.  **The Board as a Web**: Instead of seeing the chessboard as a simplr 8x8 image (like a photo), we treat it as a **web of connections**. Every piece is a "node" in this web.
-2.  **Encoding Tension**: We draw lines (edges) between pieces that are attacking or defending each other. The *strength* of these lines depends on the value of the pieces. A Queen attacking a King creates a very "heavy" line, while a Pawn attacking a Pawn is lighter. This helps the AI instantly recognize danger without having to "calculate" it from scratch every time.
-3.  **X-Ray Vision**: We also draw special lines for Pins and Skewers. If a Bishop is looking at a King but a Pawn is in the way, we draw a "Ray" that connects them. This allows the AI to "see through" pieces and understand that moving the Pawn is illegal or dangerous (a Pin).
-4.  **Selecting the Move**: Traditional engines check thousands of future moves. Our model looks at the current web of tension and assigns a score to every possible legal move. It asks: "Given the pressure on the board, which move releases tension or increases my advantage?" and selects the one with the highest score.
+1.  **See the Future**: For any given position, the Tutor generates all legal moves.
+2.  **Simulation**: It applies each move to create $N$ resulting board states.
+3.  **Graph Evaluation**: Each resulting state is converted into a graph and fed into the GNN.
+4.  **Ranking**: The GNN predicts a "Win Probability" for each state. The Tutor recommends the moves that lead to the highest win probability for the current player.
 
-## 3. Theoretical Formulation: The Chess Manifold
-We define the game of chess $\Gamma$ not as a sequence of grid matrices, but as a trajectory through a dynamic heterogeneous graph manifold $\mathcal{G} = \{G_0, G_1, \dots, G_T\}$.
+**Why this matters**: This mimics human calculation ("If I go here, the position looks good. If I go there, it looks bad") rather than just pattern matching ("Masters play e4 here").
 
-### 2.1 Heterogeneous Node Set $\mathcal{V}_t$
-The graph $G_t$ consists of two distinct node types:
-*   **Piece Nodes ($\mathcal{V}_t^P$)**: Represent physical pieces ($N \le 32$). Feature vector $\mathbf{x}_i \in \mathbb{R}^{d_P}$ encodes `[type, color, value, pos_x, pos_y]`.
-*   **Square Nodes ($\mathcal{V}_t^S$)**: Represent the spatial board distinct from occupancy ($N=64$). Feature vector $\mathbf{s}_j \in \mathbb{R}^{d_S}$ encodes `[coord_x, coord_y, occupancy_flag]`.
+## 3. Architecture
 
-### 2.2 Multi-Relational Weighted Edge Tensor $\mathcal{E}_t$
-Edges are constructed to interpret the "force field" of the board:
-*   **Interaction Edges** ($\mathcal{E}_{int}$): Connect attacking/defending pieces. Weights are derived from the sigmoid of the material value difference $\sigma(\alpha \Delta V)$, explicitly encoding the "quality" of a potential trade (e.g., trading a Queen for a Pawn is heavily penalized/weighted).
-*   **Ray-Alignment Edges** ($\mathcal{E}_{ray}$): Connect pieces along the same rank, file, or diagonal specifically to model non-local "X-ray" tactics like Pins and Skewers.
-*   **Spatial Adjacency** ($\mathcal{E}_{grid}$): Connects square nodes based on Chebyshev distance ($L_\infty=1$), providing the underlying lattice geometry.
-*   **Positional Edges** ($\mathcal{E}_{on}$): Bipartite edges linking Piece nodes to the Square nodes they occupy.
+The model is defined in `chessgnn/model.py`.
 
-## 4. Architecture Specification
+### 3.1 3-Layer Weighted ST-HGAT
+We stack **3 Layers** of Weighted Heterogeneous Graph Convolutions.
+*   **Layer 1 (Direct Interaction)**: "My Knight attacks your Pawn."
+*   **Layer 2 (Defense/Support)**: "Your Pawn is defended by your Queen."
+*   **Layer 3 (Deep Tactics)**: "The Queen is pinned to the King by my Rook."
+This depth allows the model to see complex tactical chains that a single-layer GNN would miss.
 
-The model is implemented in `chessgnn/model.py` and processing logic in `chessgnn/graph_builder.py`.
+### 3.2 Unbounded Linear Value Head
+Instead of using `Tanh` (which saturates predictions at -1/1) or `Sigmoid` (0-1), we use a linear identity output. This prevents gradient vanishing during training and allows the model to express strong confidence (e.g., scores > 1.0 for "Winning" or < -1.0 for "Losing"). For display, these scores are soft-clipped to a 0-100% Win Probability.
 
-### 4.1 Module 1: Weighted Heterogeneous Graph Transformer (WeightedHGT)
-We extend the standard HGT operator to incorporate scalar edge weights $w_{st}$ directly into the multi-head attention mechanism. For a source node $s$ and target $t$ with relationship $\phi(e)$:
+## 4. Training Methodology: Contrastive Ranking
 
-$$
-\text{Attn}(s, t) = \text{Softmax}\left( \frac{K(s) W_{\phi}^Q Q(t)}{\sqrt{d}} \cdot (1 + \lambda w_{st}) \right)
-$$
+We do not train on "Answer Key" labels (Cross-Entropy). We train on **comparison**:
 
-This modulation forces the network to attend more heavily to high-stakes interactions (e.g., threats to the King or Queen) defined by the graph builder.
+$$ \text{Loss} = \text{MSE}(\text{State}) + \lambda \times \max(0, \text{Score}_{\text{Bad}} - \text{Score}_{\text{Good}} + \text{Margin}) $$
 
-### 4.2 Module 2: Ray-Alignment Block
-To detect pinned pieces (which cannot move), we utilize features aggregated along $\mathcal{E}_{ray}$. The implementation creates direct edges between aligned pieces, carrying attributes like `blocking_count` to allow the network to infer visibility and obstruction.
+*   **Positive Sample**: The move actually played by the Grandmaster in the game.
+*   **Negative Sample**: A random legal move *not* played in that position.
+*   **Goal**: The model must assign a higher score to the GM's position than the random position. This explicitly teaches the model "Move A is better than Move B."
 
-### 4.3 Module 3: Temporal Evolution
-The input to the network is a sliding window of graphs $[G_{t-L}, \dots, G_t]$. We employ a Recurrent Neural Network (GRU) over the sequence of graph embeddings to capture the momentum and history of the game (e.g., "Has this piece been dormant?").
+## 5. Usage
 
-### 4.4 Module 4: Pointer Network Policy Head
-Unlike AlphaZero which predicts a policy over a fixed output space (4672 moves), we use a **Pointer Network**.
-1.  **Candidate Selection**: We generate a subgraph of legal moves $M_t = \{(u, v) \mid \text{move } u \to v \text{ is legal}\}$.
-2.  **Scoring**: For each candidate move $k$, we concatenate the learned embeddings of the source piece $\mathbf{h}_u$ and the target (piece or square) $\mathbf{h}_v$:
-    $$ u_k = \text{MLP}([\mathbf{h}_u || \mathbf{h}_v]) $$
-3.  **Policy**: $P(m_k) = \text{Softmax}(u_k)$.
-
-This allows the network to handle the variable action space of chess naturally and leverages the rich node representations learned by the GNN.
-
-## 5. Implementation Details
-
-### Data Pipeline
-*   **Source**: PGN files parsed via `python-chess`.
-*   **Graph Construction**: `chessgnn.graph_builder.ChessGraphBuilder` builds `PyG` (PyTorch Geometric) `HeteroData` objects on the fly.
-*   **Batching**: Custom collation handles variable-sized graphs and disjoint unions.
-
-### Project Structure
-```
-├── chessgnn/
-│   ├── graph_builder.py  # FEN -> HeteroData logic (Nodes, Edges, Weights)
-│   ├── dataset.py        # PGN -> Sliding Window Sequences
-│   ├── model.py          # ST-HGAT + Pointer Network implementation
-│   └── ...
-├── train.py              # Training loop with Curriculum support
-└── input/                # PGN datasets
-```
-
-## 6. Usage
-
-### Prerequisites
-*   Python 3.10+
-*   PyTorch >= 2.0
-*   PyTorch Geometric (PyG)
-*   python-chess
-
-### Training
-To start training on the provided sample dataset (Lichess subset):
+### Training with Deep Inspection
+Run the training script to see the Tutor learn in real-time.
 
 ```bash
 python3 train.py
 ```
 
-Configuration parameters (Batch size, Learning Rate, Window Size) are defined at the top of `train.py`.
+**Deep Inspection Logs**:
+Every 100 steps, the trainer pauses to perform a full analysis of the current board. It evaluates all legal moves and prints a ranked list:
 
-## 7. Future Work
-*   **ListMLE Loss**: Currently trained with Cross-Entropy on the single best move. Implementing ListMLE would allow ranking *all* legal moves based on Stockfish evaluations.
-*   **Dynamic Centrality**: Integrating calculating Betweenness Centrality on the fly as a dynamic node feature.
-*   **Transmissibility Gate**: Refine the Ray-Block using a learned gating mechanism based on obstruction density.
+```text
+Evaluating 34 legal moves...
+--- Top 5 Recommended Moves ---
+#1: e4e5 | WinProb: 55.2% | Raw: 0.15
+#2: g1f3 | WinProb: 54.1% | Raw: 0.12
+...
+--- Worst 3 Blunders ---
+X : g2g4 | WinProb: 32.5% | Raw: -0.41
+```
+
+### Inference (The Tutor)
+Use `tutor.py` to get recommendations for any FEN string.
+
+```python
+from tutor import CaseTutor
+# ... load model ...
+tutor = CaseTutor(model, device)
+best_move, win_prob, analysis = tutor.recommend_move("rnbqkbnr/...")
+print(f"Recommended: {best_move} ({win_prob:.1f}%)")
+```
+
+## 6. Project Structure
+
+```
+├── chessgnn/
+│   ├── graph_builder.py  # FEN -> HeteroData (Nodes, Edges, Weights)
+│   ├── dataset.py        # PGN -> Graphs + Played Move Extraction
+│   ├── model.py          # 3-Layer ST-HGAT + Value Head
+│   └── ...
+├── train.py              # Main Loop + Deep Inspection + Ranking Loss
+├── tutor.py              # Inference Logic (Evaluate & Rank)
+└── input/                # PGN datasets
+```
