@@ -1,0 +1,14 @@
+python-chess
+tqdm
+networkx
+matplotlib
+pydantic
+pydantic-ai
+node2vec
+scikit-learn
+groq
+leidenalg
+torch_geometric
+opencv-python-headless
+numpy
+chess_pack
