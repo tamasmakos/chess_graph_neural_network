@@ -1,6 +1,6 @@
 import chess
-import chessgnn.pgn
-import chessgnn.engine
+import chess.pgn
+import chess.engine
 import os
 from datetime import datetime, timedelta
 from typing import List, Tuple, Dict, Optional
@@ -10,7 +10,7 @@ import sys
 try:
     _HAS_CHESS_ENGINE = True
 except ImportError:
-    chessgnn.engine = None
+    chess.engine = None
     _HAS_CHESS_ENGINE = False
 
 from .position_to_graph import GameState, analyze_position, PositionAnalysis, _create_bipartite_chess_graph
@@ -19,7 +19,7 @@ class ChessGameProcessor:
     def __init__(self, stockfish_path: str = None):
         self.stockfish_path = stockfish_path
 
-    def get_last_n_days_games(self, pgn_file_path: str, n_days: int = 3) -> List[chessgnn.pgn.Game]:
+    def get_last_n_days_games(self, pgn_file_path: str, n_days: int = 3) -> List[chess.pgn.Game]:
         """Extract games from the last N days."""
         print(f"Extracting games from the last {n_days} days...")
         
@@ -27,7 +27,7 @@ class ChessGameProcessor:
         
         with open(pgn_file_path, 'r', encoding='utf-8') as pgn:
             while True:
-                game = chessgnn.pgn.read_game(pgn)
+                game = chess.pgn.read_game(pgn)
                 if game is None:
                     break
                 
@@ -69,11 +69,11 @@ class ChessGameProcessor:
         if 'classical' in event: return 60.0
         return 30.0
 
-    def process_game(self, game: chessgnn.pgn.Game) -> Tuple[List[GameState], List[str]]:
+    def process_game(self, game: chess.pgn.Game) -> Tuple[List[GameState], List[str]]:
         """Process a full game into GameStates and FENs."""
         board = game.board()
         # Initialize with starting position
-        fens = [chessgnn.STARTING_FEN]
+        fens = [chess.STARTING_FEN]
         # We need to create the initial GameState manually or via helper
         # Using position_to_graph's analyze_position equivalent logic but returning GameState
         
@@ -92,7 +92,7 @@ class ChessGameProcessor:
         current_time = 0.0
         
         # Add start state
-        game_states.append(self._create_game_state_from_fen(chessgnn.STARTING_FEN, 0, current_time))
+        game_states.append(self._create_game_state_from_fen(chess.STARTING_FEN, 0, current_time))
         
         for i, move in enumerate(game.mainline_moves()):
             board.push(move)
@@ -114,7 +114,7 @@ class ChessGameProcessor:
         
         return GameState(
             move_number=move_number,
-            is_white_turn=chessgnn.Board(fen).turn == chessgnn.WHITE,
+            is_white_turn=chess.Board(fen).turn == chess.WHITE,
             fen=fen,
             pieces=pos_graph.pieces,
             attack_edges=pos_graph.attack_edges,
@@ -133,15 +133,15 @@ class ChessGameProcessor:
         evals = []
         engine = None
         try:
-            engine = chessgnn.engine.SimpleEngine.popen_uci(self.stockfish_path)
+            engine = chess.engine.SimpleEngine.popen_uci(self.stockfish_path)
             for i, fen in enumerate(fens):
                 if i == 0:
                     evals.append(0.0)
                     continue
                     
-                board = chessgnn.Board(fen)
+                board = chess.Board(fen)
                 try:
-                    info = engine.analyse(board, chessgnn.engine.Limit(time=0.1)) # Faster than V3 1.0s
+                    info = engine.analyse(board, chess.engine.Limit(time=0.1)) # Faster than V3 1.0s
                     score = info["score"].white()
                     if score.is_mate():
                         val = 15000 * (1 if score.mate() > 0 else -1)
@@ -163,7 +163,7 @@ class ChessGameProcessor:
         """Infer move from two FENs."""
         # Simple implementation
         try:
-            board = chessgnn.Board(prev_fen)
+            board = chess.Board(prev_fen)
             for move in board.legal_moves:
                 board.push(move)
                 if board.fen() == curr_fen:

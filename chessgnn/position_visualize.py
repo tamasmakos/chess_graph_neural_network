@@ -31,10 +31,10 @@ def _draw_board_background(ax) -> None:
 
 def _draw_defense_edges(ax, analysis: PositionAnalysis) -> None:
     for src_square, dst_square, _ in analysis.defense_edges:
-        src_rank = chessgnn.square_rank(src_square)
-        src_file = chessgnn.square_file(src_square)
-        dst_rank = chessgnn.square_rank(dst_square)
-        dst_file = chessgnn.square_file(dst_square)
+        src_rank = chess.square_rank(src_square)
+        src_file = chess.square_file(src_square)
+        dst_rank = chess.square_rank(dst_square)
+        dst_file = chess.square_file(dst_square)
         ax.plot([src_file, dst_file], [7 - src_rank, 7 - dst_rank], color='limegreen', alpha=0.9, linewidth=3, zorder=2)
 
 
@@ -43,10 +43,10 @@ def _draw_attack_edges(ax, analysis: PositionAnalysis) -> None:
     norm = mcolors.Normalize(vmin=-8, vmax=8)
     cmap = plt.cm.get_cmap('hot_r')
     for src_square, dst_square, weight in analysis.attack_edges:
-        src_rank = chessgnn.square_rank(src_square)
-        src_file = chessgnn.square_file(src_square)
-        dst_rank = chessgnn.square_rank(dst_square)
-        dst_file = chessgnn.square_file(dst_square)
+        src_rank = chess.square_rank(src_square)
+        src_file = chess.square_file(src_square)
+        dst_rank = chess.square_rank(dst_square)
+        dst_file = chess.square_file(dst_square)
         edge_color = cmap(norm(weight))
         line_width = 2.5 + max(0.0, weight) * 0.5
         ax.annotate('', xy=(dst_file, 7 - dst_rank), xytext=(src_file, 7 - src_rank),
@@ -65,8 +65,8 @@ def _draw_pieces(ax, analysis: PositionAnalysis, centrality_scores: Dict[int, fl
             score_range = max(max_score - min_score, 1e-9)
 
     for piece in analysis.pieces:
-        rank = chessgnn.square_rank(piece.square)
-        file = chessgnn.square_file(piece.square)
+        rank = chess.square_rank(piece.square)
+        file = chess.square_file(piece.square)
         score = centrality_scores.get(piece.square, min_score)
         normalized = (score - min_score) / score_range
         scale_factor = 0.5 + normalized * 1.0  # [0.5, 1.5]
@@ -130,7 +130,7 @@ def main() -> None:
     parser.add_argument('--title', type=str, default=None, help='Optional figure title')
     args = parser.parse_args()
 
-    fen = args.fen or chessgnn.STARTING_FEN
+    fen = args.fen or chess.STARTING_FEN
     frame = render_position_frame(fen, args.centrality, args.title)
     _save_frame(frame, args.output)
     print(f"Saved frame to {args.output}")

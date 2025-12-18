@@ -85,43 +85,43 @@ class ChessGraphIterableDataset(IterableDataset):
         if len(game_moves) < 5:
             return
         
-        for i, move in enumerate(game_moves):
-            # 1. Construct Sample from current state (before push)
-            
-            # Slice buffer
-            start_index = max(0, len(window_buffer) - self.window_size)
-            sequence_graphs = window_buffer[start_index:]
-            
-            current_legal_moves = list(board.legal_moves)
+        if len(game_moves) < 5:
+            return
+        
+        # Pre-calculate all graphs for the whole game
+        all_graphs = []
+        all_graphs.append(initial_graph)
 
-            # KEY CHANGE: The target is now the Game Value
-            # If turn is WHITE: target is game_value
-            # If turn is BLACK: target is -game_value (or handle relative to 'player to move')
-            
-            # The original code had current_turn_value, but the instruction's snippet
-            # implies a change to target_value and target_index.
-            # Assuming the instruction's snippet is the desired state for the yield block.
-            target_idx = 0 # Fallback
-                
-            yield {
-                'sequence': list(window_buffer), # List of HeteroData
-                'legal_moves': current_legal_moves,
-                'target_index': target_idx,
-                'target_value': game_value, # 1.0, -1.0, 0.0
-                'played_move_uci': move.uci(), # Explicitly yield the move played
-                'fen': board.fen(),
-                'game_id': game_id
-            }
-            
-            # 2. Advance State
+        for i, move in enumerate(game_moves):
             board.push(move)
+            # We want the state *after* the move? 
+            # Original code was: 
+            # 1. Slice buffer (which has initial) -> predict
+            # 2. Push move -> add to buffer
+            #
+            # The model predicts the *evaluation of the current position*.
+            # So a sequence of length N means N positions.
+            # Position 0: Start
+            # Position 1: After Move 1
+            # ...
+            # Position N: After Move N
+            
             new_fen = board.fen()
             new_graph = self.builder.fen_to_graph(new_fen)
-            window_buffer.append(new_graph)
+            all_graphs.append(new_graph)
             
-            # Optimize buffer size
-            if len(window_buffer) > self.window_size:
-                window_buffer.pop(0)
+        # Yield the FULL game
+        # We process the entire game history.
+        # target_value is 1.0 (White Win), -1.0 (Black Win), 0.0 (Draw)
+        # We can pass this single scalar, and the loss function will expand it.
+        
+        yield {
+            'sequence': all_graphs,      # List[HeteroData], length N+1
+            'target_value': game_value,  # Scalar
+            'game_id': game_id,
+            'result': result,
+            'fen': board.fen() # Final position FEN
+        }
 
 # Dataset alias for backward compatibility if needed, but we should update train.py
 ChessGraphDataset = ChessGraphIterableDataset

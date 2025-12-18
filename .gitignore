@@ -1,6 +1,5 @@
 legacy
 stockfish
-images
 .env
 output
 __pycache__

@@ -138,91 +138,58 @@ class RayAlignmentBlock(nn.Module):
         
         # 1. Compute Transmissibility per node
         # T_v = sigmoid(W z_v + b)
-        # Represents how likely this piece is to PASS influence (e.g. pinned or transparent)
-        # Wait, Pinned pieces BLOCK? Or Pass?
-        # Logic: "If intermediate nodes have high transmissibility (empty/pinned)... influence reaches"
-        
+        # Represents likelihood to PASS influence.
         t_val = torch.sigmoid(self.transmissibility_net(x)) # [N, 1]
         
         # 2. Propagate
-        # We need to propagate along the Ray edges.
-        # But Ray edges skip intermediates? No, builder created edges between aligned pieces.
-        # The builder created DIRECT edges between ALL aligned pieces (O(N^2) on rank)?
-        # Yes, "edge between any two pieces ... regardless of obstruction".
-        # And attr has 'blocking_count'.
-        
-        # So we have direct edge u->v with blocking_count.
         # Influence = Gate(blocking_count) * Gate(Transmissibility of blockers)?
-        # This is hard to do if we don't know WHO the blockers are.
-        # The edge attr only has COUNT.
+        # For MVP: We assume direct edge exists if aligned.
+        # We modulate the message by 1 / (1 + blocking_count).
+        # This is a soft "inverse distance" weighting based on obstacles.
         
-        # Simplified Implementation as per Plan Specification:
-        # "Network learns: if blocking_count == 1 and blocker is opponent -> Pin"
-        # We use edge_attr directly.
+        # E_ray: [dist, blocking]
+        blocking_count = edge_attr_ray[:, 1].unsqueeze(-1) # [E, 1]
+        dist = edge_attr_ray[:, 0].unsqueeze(-1) # [E, 1]
         
-        # We can implement this as a GAT layer on Ray edges where attention depends on blocking_count.
-        pass # To be implemented fully in integration, for now returns x
+        # Weight = 1 / (1 + blocking + 0.1 * dist) 
+        # Favor closer and unblocked pieces.
+        ray_weight = 1.0 / (1.0 + blocking_count + 0.1 * dist)
+
+        # Apply Source Transmissibility
+        # If the source piece is NOT a slider (e.g. Knight), it should not be sending rays.
+        # ray_weight *= t_val[source]
+        row, col = edge_index_ray
+        source_transmissibility = t_val[row] 
+        ray_weight = ray_weight * source_transmissibility
+        
+        # Message passing manually or via sparse MM?
+        # Simple GAT-like: Target = Sum( Weight * Source )
+        # Using sparse matrix multiplication logic or loop.
+        
+        # Project source
+        x_proj = self.ray_proj(x)
+        
+        # Scatter add (Message Passing)
+        row, col = edge_index_ray
+        
+        # Message = x_proj[source] * weight
+        msg = x_proj[row] * ray_weight
+        
+        # Aggregate to target
+        # Using a simple scatter add implementation if torch_scatter is avail, else loop (slow) or use index_add?
+        # Standard GNN approach:
+        out = torch.zeros_like(x)
+        out.index_add_(0, col, msg)
+        
+        # Update piece features
+        # Residual connection
+        x_new = x + out
+        
+        # Update dict
+        x_dict['piece'] = x_new
         return x_dict
 
-class STHGATLikeModel(nn.Module):
-    def __init__(self, metadata, hidden_channels=64, num_layers=2):
-        super().__init__()
-        self.encoder = WeightedHGTConv(10, hidden_channels, metadata, heads=4) # piece input 10
-        # Need separate input proj for squares (3 dims)
-        self.square_proj = Linear(3, 10) # Project square to same dim as piece for HGT
-        
-        self.temporal_rnn = nn.GRU(hidden_channels, hidden_channels)
-        
-        self.policy_head = nn.Sequential(
-            Linear(hidden_channels * 2 + 1, hidden_channels), # Src + Dst + EdgeType?
-            nn.ReLU(),
-            Linear(hidden_channels, 1)
-        )
 
-    def forward(self, sequence_graphs):
-        # sequence_graphs: List[HeteroData]
-        
-        hidden_states = []
-        
-        for data in sequence_graphs:
-            # 1. Spatial Encode
-            # Project Square features
-            x_dict = data.x_dict.copy()
-            x_dict['square'] = self.square_proj(x_dict['square'])
-            
-            # Helper for edge weights
-            ew_dict = {}
-            if ('piece', 'interacts', 'piece') in data.edge_attr_dict:
-                 # Extract the weight (first dim)
-                 ew_dict[('piece', 'interacts', 'piece')] = data['piece', 'interacts', 'piece'].edge_attr[:, 0]
-
-            out_dict = self.encoder(x_dict, data.edge_index_dict, ew_dict)
-            
-            # Pool to Global or keep Node Embeddings?
-            # EvolveGCN updates WEIGHTS.
-            # Here we just use GRU on embeddings (simpler baseline) or implement EvolveGCN properly?
-            # Plan: "EvolveGCN adapts the parameters of the GNN layer".
-            # That's complex to implement in one shot. 
-            # I will fallback to GRU over node embeddings for the MVP, or just process frame by frame and pool.
-            
-            # Let's effectively use the last frame's embeddings, but context from RNN?
-            # For MVP: Run GNN on last frame only is a strong baseline.
-            # To add temporal: Concatenate history to features?
-            
-            # Using simple per-node GRU if nodes are consistent?
-            # Nodes are NOT consistent (pieces move/die).
-            # This is the "Variable Node" problem.
-            
-            # Solution: Graph Recurrent Network usually assumes fixed nodes or explicit matching.
-            # Pivot: Use Transformer over temporal sequence of *pooled* graph vectors?
-            # Or just use the LAST frame for the spatial graph, but include history features in the input?
-            # The input already has "history" (recurent state) in the spec?
-            # "h_hist: Recurrent state vector carried over".
-            
-            # We will return the node embeddings of the last graph.
-            z_final = out_dict
-            
-        return z_final
 
 class STHGATLikeModel(nn.Module):
     def __init__(self, metadata, hidden_channels=64, num_layers=3):
@@ -231,6 +198,7 @@ class STHGATLikeModel(nn.Module):
         self.hidden_channels = hidden_channels
         
         self.square_proj = Linear(3, 10) 
+        self.ray_block = RayAlignmentBlock(hidden_channels) 
         
         # Stack of GNN Layers
         self.convs = nn.ModuleList()
@@ -242,7 +210,8 @@ class STHGATLikeModel(nn.Module):
              self.convs.append(WeightedHGTConv(hidden_channels, hidden_channels, metadata, heads=4))
 
         # Temporal RNN (Simplified: GRU over global graph state)
-        self.global_gru = nn.GRU(hidden_channels, hidden_channels, batch_first=True)
+        # Input to GRU is now 2 * hidden (Piece + Square pool)
+        self.global_gru = nn.GRU(hidden_channels * 2, hidden_channels, batch_first=True)
         
         # Add Value Head
         self.value_head = nn.Sequential(
@@ -253,48 +222,137 @@ class STHGATLikeModel(nn.Module):
         )
         
         # Initialize final layer to 0 to start with 0.0 prediction
+        # Initialize final layer to 0 to start with 0.0 prediction
         nn.init.constant_(self.value_head[2].weight, 0.0)
         nn.init.constant_(self.value_head[2].bias, 0.0)
+        # glorot(self.value_head[2].weight)
+        # self.value_head[2].bias.data.fill_(0)
 
     def forward(self, sequence_graphs):
-        # sequence_graphs: List[HeteroData] (Length T)
+        # sequence_graphs: List[HeteroData] (Length T) representing the full game
         
-        temporal_embeddings = []
+        # 1. Batch the entire sequence into one Super-Graph
+        # This allows parallel computation of GNN over all time steps
+        from torch_geometric.data import Batch
+        batch = Batch.from_data_list(sequence_graphs)
         
-        for data in sequence_graphs:
-            # 1. Spatial Encode per Graph
-            x_dict = data.x_dict.copy()
-            x_dict['square'] = self.square_proj(x_dict['square'])
-            
-            # Edge Weights
-            ew_dict = {}
-            if ('piece', 'interacts', 'piece') in data.edge_attr_dict:
-                 ew_dict[('piece', 'interacts', 'piece')] = data['piece', 'interacts', 'piece'].edge_attr[:, 0]
+        # 2. Spatial Encode (Parallel)
+        x_dict = batch.x_dict.copy()
+        x_dict['square'] = self.square_proj(x_dict['square'])
+        
+        # Edge Weights
+        ew_dict = {}
+        if ('piece', 'interacts', 'piece') in batch.edge_attr_dict:
+                ew_dict[('piece', 'interacts', 'piece')] = batch['piece', 'interacts', 'piece'].edge_attr[:, 0]
 
-            # Multi-Layer GNN Pass
-            for i, conv in enumerate(self.convs):
-                 x_dict = conv(x_dict, data.edge_index_dict, ew_dict)
-            
-            z_dict = x_dict 
+        # Multi-Layer GNN Pass
+        for i, conv in enumerate(self.convs):
+                x_dict = conv(x_dict, batch.edge_index_dict, ew_dict)
+        
+        z_dict = x_dict 
 
-            # Pool node embeddings into a single Graph Embedding
-            piece_embeds = z_dict['piece'] 
-            graph_embed = torch.mean(piece_embeds, dim=0) # [Hidden_Dim]
-            
-            temporal_embeddings.append(graph_embed)
-            
-        # Stack Temporal Sequence
-        # Shape: [1, Sequence_Length, Hidden_Dim] (Batch=1)
-        seq_tensor = torch.stack(temporal_embeddings).unsqueeze(0) 
+        # Ray Alignment Block (Spatial Logic)
+        if ('piece', 'ray', 'piece') in batch.edge_index_dict:
+                x_dict = self.ray_block(x_dict, 
+                                        batch.edge_index_dict[('piece', 'ray', 'piece')],
+                                        batch.edge_attr_dict[('piece', 'ray', 'piece')])
+
+        z_dict = x_dict 
+
+        # 3. Pooling (Graph Level)
+        # We need to pool nodes back to their respective graphs in the batch.
+        # Batch.batch maps nodes to batch index.
+        # batch.batch_dict['piece'] -> [N_total_pieces] (indices 0 to T-1)
         
-        # 2. Temporal Process (GRU)
-        # Output: [1, Sequence_Length, Hidden_Dim]
-        # h_n: [1, 1, Hidden_Dim]
-        gru_out, h_n = self.global_gru(seq_tensor)
+        from torch_geometric.nn import global_mean_pool
         
-        # Use the final state
-        final_embedding = h_n.squeeze(0).squeeze(0) # [Hidden_Dim]
+        piece_embeds = z_dict['piece'] 
+        square_embeds = z_dict['square']
         
-        # 3. Predict Win Probability
-        value = self.value_head(final_embedding)
-        return value
+        # Pool Pieces
+        # Some graphs might have NO pieces (rare but possible in empty board? No, kings always exist).
+        # We assume batch indices exist.
+        batch_index_piece = batch[ 'piece' ].batch
+        p_pool = global_mean_pool(piece_embeds, batch_index_piece) # [T, Hidden]
+        
+        # Pool Squares
+        batch_index_square = batch[ 'square' ].batch
+        s_pool = global_mean_pool(square_embeds, batch_index_square) # [T, Hidden]
+        
+        # Concatenate
+        graph_embeds = torch.cat([p_pool, s_pool], dim=1) # [T, 2 * Hidden]
+        
+        # 4. Temporal Process (GRU)
+        # Input: [Batch=1, Seq_Len=T, Input_Dim]
+        seq_tensor = graph_embeds.unsqueeze(0) 
+        
+        # GRU
+        # output: [1, T, Hidden]
+        gru_out, _ = self.global_gru(seq_tensor)
+        
+        # 5. Predict Win Probability for ALL steps
+        # output: [1, T, 1]
+        values = self.value_head(gru_out)
+        
+        return values
+
+    def forward_step(self, graph, h_prev=None):
+        """
+        Runs one step of inference for minimal latency.
+        Args:
+            graph (HeteroData): The current board state graph.
+            h_prev (Tensor, optional): Previous GRU hidden state [1, 1, Hidden].
+        Returns:
+            value (Tensor): Win probability logit [1, 1].
+            h_new (Tensor): New GRU hidden state [1, 1, Hidden].
+        """
+        # 1. Spatial Encode (Single Graph)
+        x_dict = graph.x_dict.copy()
+        x_dict['square'] = self.square_proj(x_dict['square'])
+        
+        # Edge Weights
+        ew_dict = {}
+        if ('piece', 'interacts', 'piece') in graph.edge_attr_dict:
+                 ew_dict[('piece', 'interacts', 'piece')] = graph['piece', 'interacts', 'piece'].edge_attr[:, 0]
+
+        # Multi-Layer GNN Pass
+        for i, conv in enumerate(self.convs):
+            # No batch index needed for single graph, but GNN expects edge_index dict
+            x_dict = conv(x_dict, graph.edge_index_dict, ew_dict)
+        
+        z_dict = x_dict 
+
+        # Ray Alignment Block
+        if ('piece', 'ray', 'piece') in graph.edge_index_dict:
+                x_dict = self.ray_block(x_dict, 
+                                        graph.edge_index_dict[('piece', 'ray', 'piece')],
+                                        graph.edge_attr_dict[('piece', 'ray', 'piece')])
+
+        z_dict = x_dict 
+        
+        # 2. Pooling
+        from torch_geometric.nn import  global_mean_pool
+        
+        # For a single graph without batch attribute, we treat all nodes as batch 0
+        p_pool = torch.mean(z_dict['piece'], dim=0, keepdim=True) # [1, Hidden]
+        s_pool = torch.mean(z_dict['square'], dim=0, keepdim=True) # [1, Hidden]
+        
+        graph_embed = torch.cat([p_pool, s_pool], dim=1) # [1, 2 * Hidden]
+        
+        # 3. Temporal Update (GRU Cell equivalent)
+        # GRU expects input [Batch, Seq, Feature] if using full GRU with batch_first=True
+        # We process a sequence of length 1
+        seq_tensor = graph_embed.unsqueeze(0) # [1, 1, 2*Hidden]
+        
+        if h_prev is None:
+            # Init hidden state
+             h_prev = torch.zeros(1, 1, self.hidden_channels, device=graph_embed.device)
+        
+        gru_out, h_new = self.global_gru(seq_tensor, h_prev)
+        # gru_out: [1, 1, Hidden]
+        # h_new: [1, 1, Hidden]
+        
+        # 4. Predict
+        value = self.value_head(gru_out.squeeze(0).squeeze(0)) # [1]
+        
+        return value, h_new

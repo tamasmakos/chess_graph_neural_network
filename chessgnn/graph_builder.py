@@ -89,6 +89,11 @@ class ChessGraphBuilder:
             edge_index_on[1].append(square_indices[sq])
         
         data['piece', 'on', 'square'].edge_index = torch.tensor(edge_index_on, dtype=torch.long)
+
+        # Reverse Edge: Square -> Piece (Occupied By)
+        # Allows squares to inform pieces about their location properties (e.g. center control)
+        data['square', 'occupied_by', 'piece'].edge_index = torch.tensor([edge_index_on[1], edge_index_on[0]], dtype=torch.long)
+
         
         # Square-Square (Adjacency)
         # Edge type: ('square', 'adjacent', 'square')

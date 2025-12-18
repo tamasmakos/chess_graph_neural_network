@@ -12,12 +12,12 @@ from chessgnn.model import STHGATLikeModel
 
 # Configuration
 PGN_FILE = "/workspaces/chessgnn/input/lichess_db_standard_rated_2013-01.pgn"
-BATCH_SIZE = 10 # We use batch size 1 (sequence of 1 game) for simplicity
-HIDDEN_DIM = 128
-LR = 0.0005
+BATCH_SIZE = 1 
+HIDDEN_DIM = 256
+LR = 0.005 
 EPOCHS = 2
 TRAIN_GAMES = 100
-TEST_GAMES = 50
+TEST_GAMES = 5
 
 # Setup Logging
 import logging
@@ -33,147 +33,77 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def tutor_spotlight(model, test_loader, device):
+
+from chessgnn.game_processor import ChessGameProcessor
+from chessgnn.visualizer import ChessVisualizer, GameVideoGenerator
+from chessgnn.graph_builder import ChessGraphBuilder
+
+def visualize_test_games(model, pgn_file, num_games, offset, device, epoch):
     """
-    Selects a random position from the test set and has the model 'commentate' on it.
+    Visualizes test games by generating videos with dynamic win probability plots.
     """
     model.eval()
     logger.info("\n" + "="*50)
-    logger.info("  ♟️  TUTOR SPOTLIGHT ANALYST  ♟️")
+    logger.info(f"  🎥  VISUALIZING {num_games} TEST GAMES (Epoch {epoch})  🎥")
     logger.info("="*50)
     
-    # Grab one batch (game)
-    batch = next(iter(test_loader))
-    sample_dict = batch[0]
+    vis = ChessVisualizer()
+    video_gen = GameVideoGenerator(vis)
+    processor = ChessGameProcessor(stockfish_path="/workspaces/chessgnn/stockfish/src/stockfish")
+    builder = ChessGraphBuilder()
     
-    # Pick a random step in the game sequence
-    seq_len = len(sample_dict['sequence'])
-    if seq_len == 0: return # Safety
-    
-    # Use the last frame (latest position)
-    graph = sample_dict['sequence'][-1].to(device)
-    fen = sample_dict['fen']
-    target_val = sample_dict['target_value']
-    
-    # Run Model
-    with torch.no_grad():
-        # Model expects a list of graphs (sequence)
-        score = model([graph]).item() # -1 to 1
-    
-    # Visual Interpretation
-    win_prob = (score + 1) / 2 * 100 # 0% to 100%
-    
-    # Color/Emoji logic
-    if win_prob > 55:
-        judgement = "White is winning"
-        emoji = "⚪"
-    elif win_prob < 45:
-        judgement = "Black is winning"
-        emoji = "⚫"
-    else:
-        judgement = "Position is Equal"
-        emoji = "⚖️"
-        
-    actual_res = "Draw"
-    if target_val > 0.5: actual_res = "White Won"
-    elif target_val < -0.5: actual_res = "Black Won"
-    
-    board = chess.Board(fen)
-    logger.info(f"Position: {fen}")
-    logger.info(f"Analysis: {emoji} {judgement} ({win_prob:.1f}% Win Prob)")
-    logger.info(f"Actual Game Result: {actual_res}")
-    
-    # Simple ASCII Board
-    logger.info("\n" + str(board) + "\n")
-    logger.info("="*50 + "\n")
+    # Skip to test games
+    with open(pgn_file) as f:
+        for _ in range(offset):
+            if chess.pgn.read_game(f) is None:
+                return
 
-
-# ... existing code ...
-from chessgnn.graph_builder import ChessGraphBuilder
-
-def deep_inspection(model, fen, sequence, device, builder):
-    """
-    Evaluates ALL legal moves in the position and logs a ranked list.
-    Now temporally aware: uses the provided history sequence.
-    """
-    model.eval()
-    board = chess.Board(fen)
-    legal_moves = list(board.legal_moves)
-    
-    if not legal_moves:
-        return
-
-    logger.info(f"\n🔍 DEEP INSPECTION (Step Analysis) 🔍")
-    logger.info(f"Position: {fen}")
-    logger.info(f"Evaluating {len(legal_moves)} legal moves with history context...")
-    
-    move_analysis = []
-    
-    # Pre-process history: ensure it's on device
-    history_window = [g.to(device) for g in sequence]
-    # If history is full (window size 8), we'll slice [1:] when appending new move
-    
-    for move in legal_moves:
-        board.push(move)
-        # Convert resultant position to graph
-        try:
-            graph = builder.fen_to_graph(board.fen())
-            graph = graph.to(device)
-            
-            # Construct Temporal Sequence for this candidate
-            # Pivot: Slide window if needed found in dataset.py logic?
-            # Model GRU handles variable length, but for consistency with training (window=8),
-            # we should maintain similar context length.
-            # If len(history_window) >= 8, drop first.
-            
-            if len(history_window) >= 8:
-                 candidate_seq = history_window[1:] + [graph]
-            else:
-                 candidate_seq = history_window + [graph]
-            
-            # Model evaluation
-            # Pass as list of graphs (model expects sequence_graphs)
-            score = model(candidate_seq).item()
+        for i in range(num_games):
+            game = chess.pgn.read_game(f)
+            if game is None:
+                break
                 
-            # Softsign is already in model, outputs -1..1
-            display_score = score 
-            # Convert to Win Prob %
-            win_prob = (display_score + 1) / 2 * 100
+            game_states, fens = processor.process_game(game)
             
-            move_analysis.append((move.uci(), win_prob, score))
-        except Exception as e:
-            pass 
-        finally:
-            board.pop()
+            # Get Stockfish Evaluations
+            stockfish_evals = processor.get_stockfish_evaluations(fens)
+
+            # Predict Win Probs
+            # We need to feed the sequence to the model
+            # Model expects [Batch, Time, Features] or List[Graph] if handled by collate/forward
+            # Our model.forward takes a list of HeteroData (history)
             
-    # Sort Analysis
-    # If White Turn: Descending (Higher is better for White)
-    # If Black Turn: Ascending (Lower is better for Black, i.e. higher Black Win Prob)
-    
-    # Actually, simpler interpretation:
-    # The model outputs "White Advantage".
-    # So we sort by raw Score.
-    
-    # But for "Best Move" display, we want the best move for the CURRENT player.
-    if board.turn == chess.WHITE:
-        move_analysis.sort(key=lambda x: x[2], reverse=True) # Maximize White Score
-        best_label = "White (Max Score)"
-    else:
-        move_analysis.sort(key=lambda x: x[2], reverse=False) # Minimize White Score (Maximize Black)
-        best_label = "Black (Min Score)"
+            win_probs = []
+            history_graphs = []
+            
+            # ... (inference loop) ...
+            for fen in fens:
+                graph = builder.fen_to_graph(fen).to(device)
+                history_graphs.append(graph)
+                
+                # Keep history window reasonable (e.g. 8) OR pass full history if model supports it
+                seq_window = history_graphs[-16:]
+                
+                with torch.no_grad():
+                    # model(seq) -> [1, T, 1]
+                    # We only care about the last step
+                    scores = model(seq_window)
+                    last_score = scores[0, -1, 0].item()
+                    
+                prob = (last_score + 1) / 2 * 100
+                win_probs.append(prob)
+                
+            # Generate Video
+            output_path = f"output/videos/epoch_{epoch}_game_{i+1}.mp4"
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
+            video_gen.generate_video(game_states, win_probs, stockfish_evals, output_path, fps=2)
+            logger.info(f"Generated video: {output_path}")
 
-    logger.info(f"--- Top 5 Recommended Moves for {best_label} ---")
-    for i, (uci, prob, score) in enumerate(move_analysis[:5]):
-        logger.info(f"#{i+1}: {uci} | WinProb: {prob:.1f}% | Raw: {score:.4f}")
-        
-    logger.info(f"--- Worst 3 Blunders (Avoid) ---")
-    for i, (uci, prob, score) in enumerate(move_analysis[-3:]):
-        logger.info(f"X : {uci} | WinProb: {prob:.1f}% | Raw: {score:.4f}")
-        
-    logger.info("------------------------------------------------\n")
-    model.train() # Switch back to train mode
+    logger.info("="*50 + "\n")
+    model.train()
 
-# ... imports ...
+
 import random
 
 def train():
@@ -205,12 +135,11 @@ def train():
     
     # Loss Functions
     mse_criterion = nn.MSELoss() 
-    # Ranking Margin removed (Outcome Regression Only)
     
-    train_loader = DataLoader(train_dataset, batch_size=1, collate_fn=custom_collate, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=1, collate_fn=custom_collate, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, collate_fn=custom_collate, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, collate_fn=custom_collate, num_workers=4)
     
-    logger.info("Starting training loop...")
+    logger.info(f"Starting training loop... Batch Size={BATCH_SIZE}, LR={LR}")
     
     for epoch in range(EPOCHS):
         model.train()
@@ -220,94 +149,79 @@ def train():
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         epoch_steps = 0
         
-        # Per-Game Stats placeholders
-        current_game_id = None
-        game_loss_accum = 0.0
-        game_steps = 0
-        
-        for batch in pbar:
-            sample_dict = batch[0]
-            
-            # Game Boundary Check
-            sample_game_id = sample_dict['game_id']
-            if current_game_id is None: current_game_id = sample_game_id
-            # Logspam reduction: With parallel workers, IDs flip constantly. 
-            # We disable "Game Finished" logging to clean up the output.
-            if sample_game_id != current_game_id:
-                # avg_game_loss = game_loss_accum / game_steps if game_steps > 0 else 0
-                # logger.info(f"==> Game {current_game_id} Finished | Avg Loss: {avg_game_loss:.4f}")
-                current_game_id = sample_game_id
-                game_loss_accum = 0.0
-                game_steps = 0
-            
-            # 1. Positive Sample (Played Move)
-            sequence = sample_dict['sequence'] 
-            # Move to device
-            sequence = [g.to(device) for g in sequence]
-            
-            target_val = sample_dict['target_value'] # -1, 0, 1 (Game Result)
-            # MSE Target for the STATE
-            target = torch.tensor([target_val], device=device).float()
+        for batch_list in pbar:
+            # batch_list: List[Dict]
             
             optimizer.zero_grad()
+            batch_loss = 0.0
+            total_target_val = 0.0
+            count = 0
             
-            # Forward Pass (Positive - The real state that occurred)
-            score_pos = model(sequence) # Scalar output for State_t
+            last_sample = None
             
-            mse_loss = mse_criterion(score_pos, target)
+            # Gradient Accumulation Implementation
+            for sample_dict in batch_list:
+                
+                sequence = sample_dict['sequence'] 
+                # sequence is already a list of HeteroData.
+                # Ensure they are on device.
+                sequence = [g.to(device) for g in sequence]
+                
+                target_val = sample_dict['target_value'] 
+                
+                # Model Forward
+                # Output: [1, T, 1] (Batch=1)
+                score_seq = model(sequence) 
+                
+                # Target Construction
+                # We want to supervise EVERY step with the final game result.
+                # Target: [1, T, 1]
+                T = score_seq.shape[1]
+                target = torch.full((1, T, 1), target_val, device=device).float()
+                
+                loss = mse_criterion(score_seq, target)
+                
+                # Normalize by batch size (usually 1 here)
+                loss_scaled = loss / len(batch_list)
+                loss_scaled.backward()
+                
+                if not math.isnan(loss.item()):
+                    batch_loss += loss.item()
+                count += 1
+                
+                total_target_val += target_val
+                last_sample = sample_dict
             
-            # --- MODIFIED: Removed "Easy Negative" Ranking Loss ---
-            # We now rely solely on Outcome Regression (MSE) to learn the Value Function V(s).
-            # This avoids the trap of learning "Safe > Blunder" without learning true strategy.
-            # To recommend moves, we simply evaluate V(s') for all legal next states s'.
-
-            # Loss
-            loss = mse_loss
-
-            
-            loss.backward()
-            
-            # Clip Gradients to prevent explosion driving Tanh to saturation
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             optimizer.step()
             
-            current_loss = loss.item()
-            total_loss += current_loss
+            avg_loss = batch_loss / count if count > 0 else 0
+            
+            total_loss += avg_loss
             total_samples += 1
             epoch_steps += 1
             
-            game_loss_accum += current_loss
-            game_steps += 1
-            
-            # Logging detailed step info every 50 steps
-            if epoch_steps % 50 == 0:
-                 # Convert score to Win Probability %
-                 # Since we removed Tanh from model, we apply it here for display interpretation
-                 # score 0 -> 50%, score 1 -> ~88%, score -1 -> ~12%
-                 # Actually, let's just stick to the -1..1 semantics for 'WinProb'
-                 raw_score = score_pos.item()
-                 # Apply soft clipping for display
-                 # Softsign maps to -1..1
-                 display_score = raw_score 
-                 win_prob = (display_score + 1) / 2 * 100
-                 
-                 logger.info(f"Step {epoch_steps} | Game {current_game_id} | Loss: {current_loss:.4f} (MSE:{mse_loss.item():.4f}) | WinProb: {win_prob:.1f}%")
-
-            # --- NEW: DEEP INSPECTION EVERY 100 STEPS ---
-            if epoch_steps % 100 == 0:
-                 try:
-                    deep_inspection(model, sample_dict['fen'], sample_dict['sequence'], device, graph_builder)
-                 except Exception as e:
-                    logger.error(f"Deep inspection failed: {e}")
-
-
+            # LOGGING FREQUENCY CHANGED: EACH STEP
+            if epoch_steps % 1 == 0:
+                 # Take mean of the last game's predictions or just the last step?
+                 # Let's take the Last Step of the last game processed
+                 last_score = score_seq[0, -1, 0].item()
+                 win_prob = (last_score + 1) / 2 * 100
+                 actual_win = (total_target_val / count + 1) / 2 * 100 if count > 0 else 50.0
+                 logger.info(f"Step {epoch_steps} | Loss: {avg_loss:.4f} | WinProb: {win_prob:.1f}% | ActualWin: {actual_win:.1f}%")
 
 
     # Save Model
     save_path = os.path.join("output", "st_hgat_model.pt")
     torch.save(model.state_dict(), save_path)
     logger.info(f"Model saved to {save_path}")
+
+    # Final Visualization
+    try:
+        visualize_test_games(model, PGN_FILE, TEST_GAMES, TRAIN_GAMES, device, "final")
+    except Exception as e:
+        logger.error(f"Final visualization failed: {e}")
 
 if __name__ == "__main__":
     train()

@@ -102,34 +102,34 @@ class PositionAnalysis:
 # --- Core logic ---------------------------------------------------------------------------------
 
 _PIECE_VALUES: Dict[int, int] = {
-    chessgnn.PAWN: 1,
-    chessgnn.KNIGHT: 3,
-    chessgnn.BISHOP: 3,
-    chessgnn.ROOK: 5,
-    chessgnn.QUEEN: 9,
-    chessgnn.KING: 20,
+    chess.PAWN: 1,
+    chess.KNIGHT: 3,
+    chess.BISHOP: 3,
+    chess.ROOK: 5,
+    chess.QUEEN: 9,
+    chess.KING: 20,
 }
 
 
-def _get_piece_value(piece: chessgnn.Piece) -> int:
+def _get_piece_value(piece: chess.Piece) -> int:
     return _PIECE_VALUES.get(piece.piece_type, 0)
 
 
 def _create_bipartite_chess_graph(fen: str) -> PositionGraph:
-    board = chessgnn.Board(fen)
+    board = chess.Board(fen)
 
     # Collect piece info
     pieces: List[PieceInfo] = []
-    for square in chessgnn.SQUARES:
+    for square in chess.SQUARES:
         piece = board.piece_at(square)
         if piece is None:
             continue
         pieces.append(
             PieceInfo(
                 square=square,
-                square_name=chessgnn.square_name(square),
+                square_name=chess.square_name(square),
                 piece_type=piece.piece_type,
-                is_white=(piece.color == chessgnn.WHITE),
+                is_white=(piece.color == chess.WHITE),
                 symbol=piece.symbol(),
                 value=_get_piece_value(piece),
             )
@@ -139,7 +139,7 @@ def _create_bipartite_chess_graph(fen: str) -> PositionGraph:
     defense_edges: List[Tuple[int, int, float]] = []
 
     # Attack edges: src can capture dst. Weight encodes trade quality.
-    for src_square in chessgnn.SQUARES:
+    for src_square in chess.SQUARES:
         src_piece = board.piece_at(src_square)
         if src_piece is None:
             continue
@@ -165,7 +165,7 @@ def _create_bipartite_chess_graph(fen: str) -> PositionGraph:
                 attack_edges.append((src_square, dst_square, weight))
 
     # Defense edges: same-color defenders of an occupied square.
-    for defended_square in chessgnn.SQUARES:
+    for defended_square in chess.SQUARES:
         defended_piece = board.piece_at(defended_square)
         if defended_piece is None:
             continue
